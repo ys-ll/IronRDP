@@ -2364,7 +2364,7 @@ impl ClientConnector {
             Err(_) => return Ok(Cow::Borrowed(input)),
         };
 
-        let mcs::McsMessage::SendDataIndication(data) = x224.0 else {
+        let mcs::McsMessage::SendDataIndication(mut data) = x224.0 else {
             return Ok(Cow::Borrowed(input));
         };
 
@@ -2390,7 +2390,27 @@ impl ClientConnector {
                     plain
                 }
             } else {
-                return Ok(Cow::Borrowed(input));
+                // Plaintext slow-path frame under Standard RDP Security: the
+                // 4-byte BasicSecurityHeader is still present (xrdp's LOW
+                // level sends zero-flag plaintext frames). Strip it so the
+                // downstream decoders — written for Enhanced RDP Security's
+                // headerless shape — see the canonical payload. Licensing
+                // frames keep the embedded header: the LicensePdu decoder
+                // consumes it (the same shape the encrypted-license path
+                // restores above).
+                let is_license_phase = matches!(
+                    self.state,
+                    ClientConnectorState::LicensingExchange { .. }
+                        | ClientConnectorState::ConnectTimeAutoDetection { .. }
+                );
+                let is_message_channel = self.message_channel_id == Some(data.channel_id);
+                if is_license_phase && !is_message_channel {
+                    return Ok(Cow::Borrowed(input));
+                }
+                if data.user_data.len() >= BASIC_SECURITY_HEADER_SIZE {
+                    data.user_data = Cow::Owned(data.user_data[BASIC_SECURITY_HEADER_SIZE..].to_vec());
+                }
+                data.user_data.into_owned()
             }
         } else {
             return Ok(Cow::Borrowed(input));

@@ -3,6 +3,7 @@ use std::sync::Arc;
 
 use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType};
 use ironrdp_core::{MonotonicInstant, ReadCursor, WriteBuf, decode, decode_cursor, encode_vec};
+use ironrdp_pdu::rdp::headers::BASIC_SECURITY_HEADER_SIZE;
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout};
 use ironrdp_dvc::pdu::SoftSyncTunnelType;
@@ -484,7 +485,22 @@ impl ActiveStage {
                     .collect::<Vec<_>>()
                     .join(" ")
             );
-            return Ok(Cow::Borrowed(frame));
+            // Plaintext slow-path frame under Standard RDP Security: the
+            // 4-byte BasicSecurityHeader is still present (xrdp's LOW level
+            // sends zero-flag plaintext frames). Strip it — the session
+            // decoders are written for Enhanced RDP Security's headerless
+            // shape.
+            let mut user_data = data.user_data.into_owned();
+            if user_data.len() >= BASIC_SECURITY_HEADER_SIZE {
+                user_data.drain(..BASIC_SECURITY_HEADER_SIZE);
+            }
+            let stripped = mcs::McsMessage::SendDataIndication(mcs::SendDataIndication {
+                initiator_id: data.initiator_id,
+                channel_id: data.channel_id,
+                user_data: Cow::Owned(user_data),
+            });
+            let rebuilt = encode_vec(&X224(stripped)).map_err(SessionError::encode)?;
+            return Ok(Cow::Owned(rebuilt));
         }
         if data.user_data.len() < 12 {
             return Err(reason_err!("x224", "encrypted slow-path PDU is too short for a MAC"));
