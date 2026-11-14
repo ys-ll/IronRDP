@@ -1562,7 +1562,7 @@ impl Sequence for ClientConnector {
         // channel itself.
         let io_channel_phase_ids = match &self.state {
             ClientConnectorState::ConnectTimeAutoDetection { io_channel_id, user_channel_id }
-            | ClientConnectorState::LicensingExchange { io_channel_id, user_channel_id } => {
+            | ClientConnectorState::LicensingExchange { io_channel_id, user_channel_id, .. } => {
                 Some((*io_channel_id, *user_channel_id))
             }
             ClientConnectorState::CapabilitiesExchange { connection_activation }
