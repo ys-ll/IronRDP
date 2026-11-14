@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use ironrdp_bulk::{BulkCompressor, CompressionType as BulkCompressionType};
 use ironrdp_core::{MonotonicInstant, ReadCursor, WriteBuf, decode, decode_cursor, encode_vec};
-use ironrdp_pdu::rdp::headers::BASIC_SECURITY_HEADER_SIZE;
 use ironrdp_displaycontrol::client::DisplayControlClient;
 use ironrdp_displaycontrol::pdu::{DisplayControlCapabilities, DisplayControlMonitorLayout};
 use ironrdp_dvc::pdu::SoftSyncTunnelType;
