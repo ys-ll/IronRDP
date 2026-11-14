@@ -1383,6 +1383,7 @@ impl ClientConnector {
         &mut self,
         ctx: mcs::SendDataIndicationCtx<'_>,
         received_at: Option<MonotonicInstant>,
+        io_channel_id: u16,
         user_channel_id: u16,
         output: &mut WriteBuf,
     ) -> ConnectorResult<Written> {
@@ -1390,7 +1391,14 @@ impl ClientConnector {
             Some(request) => {
                 debug!(?request, phase = self.state.name(), "Answering an Auto-Detect Request");
 
-                self.respond_to_connect_time_autodetect(request, received_at, ctx.channel_id, user_channel_id, output)
+                self.respond_to_connect_time_autodetect(
+                    request,
+                    received_at,
+                    io_channel_id,
+                    ctx.channel_id,
+                    user_channel_id,
+                    output,
+                )
             }
             // [MS-RDPBCGR] 1.3.1.1 places multitransport bootstrapping after licensing, so
             // an Initiate Multitransport Request outside it is off-sequence. It is not
@@ -1552,28 +1560,23 @@ impl Sequence for ClientConnector {
         // phase goes on waiting. See `step_message_channel_pdu`. Multitransport
         // bootstrapping reads its requests from the message channel, so it routes by
         // channel itself.
-        let io_channel_phase_user_channel_id = match &self.state {
-            ClientConnectorState::ConnectTimeAutoDetection { user_channel_id, .. }
-            | ClientConnectorState::LicensingExchange { user_channel_id, .. } => Some(*user_channel_id),
+        let io_channel_phase_ids = match &self.state {
+            ClientConnectorState::ConnectTimeAutoDetection { io_channel_id, user_channel_id }
+            | ClientConnectorState::LicensingExchange { io_channel_id, user_channel_id } => {
+                Some((*io_channel_id, *user_channel_id))
+            }
             ClientConnectorState::CapabilitiesExchange { connection_activation }
             | ClientConnectorState::ConnectionFinalization { connection_activation } => {
-                Some(connection_activation.user_channel_id())
+                Some((connection_activation.io_channel_id(), connection_activation.user_channel_id()))
             }
             _ => None,
         };
 
-        if let Some(user_channel_id) = io_channel_phase_user_channel_id
+        if let Some((io_channel_id, user_channel_id)) = io_channel_phase_ids
             && let Some(ctx) = self.message_channel_pdu(input)
         {
-            return self.step_message_channel_pdu(ctx, received_at, user_channel_id, output);
+            return self.step_message_channel_pdu(ctx, received_at, io_channel_id, user_channel_id, output);
         }
-        // Standard RDP Security: recover the plaintext of an encrypted inbound
-        // PDU before the state machine sees it. The cryptor is armed during
-        // the Secure Settings Exchange, so every S2C PDU from licensing
-        // onwards is decrypted here.
-        let input = self.decrypt_s2c_input(input)?;
-        let input = input.as_ref();
->>>>>>> 87bcb566
 
         let (written, next_state) = match mem::take(&mut self.state) {
             // Invalid state
@@ -2037,7 +2040,7 @@ impl Sequence for ClientConnector {
                     // `step_message_channel_pdu`. Only multitransport requests count
                     // towards the cap.
                     if !security_header_contains(ctx.user_data, rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ) {
-                        let written = self.step_message_channel_pdu(ctx, received_at, user_channel_id, output)?;
+                        let written = self.step_message_channel_pdu(ctx, received_at, io_channel_id, user_channel_id, output)?;
 
                         self.state = ClientConnectorState::MultitransportBootstrapping {
                             io_channel_id,
