@@ -238,12 +238,11 @@ impl RdpSecurity {
     /// SECURE_CHECKSUM variant appends the little-endian counter to the SHA1
     /// tail (the GenerateMACSignature variant with fIncludeEncryptionCount).
     pub fn mac(&self, data: &[u8], count: Option<u32>) -> [u8; 8] {
-        // MacSaltKey is always the full 16-byte (salted) sign key, regardless
-        // of the effective RC4 key length (MS-RDPBCGR 5.3.6.1; FreeRDP's
-        // security_mac_data asserts mac_salt_key_length == 16). Truncating it
-        // to key_len breaks MAC verification at 40/56-bit and derails the
-        // keystream resync scanner.
-        let k = &self.sign_key;
+        // The MAC key is the sign key truncated to the effective RC4 key
+        // length (FreeRDP security_mac_signature uses sign_key with
+        // rc4_key_len; xrdp's xrdp_sec_sign does the same). Only 128-bit uses
+        // the full 16 bytes.
+        let k = &self.sign_key[..self.key_len];
         let mut sha_input = Vec::with_capacity(k.len() + PAD1.len() + 4 + data.len() + 4);
         sha_input.extend_from_slice(k);
         sha_input.extend_from_slice(&PAD1[..]);
