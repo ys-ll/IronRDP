@@ -4455,6 +4455,7 @@ async fn active_session(
         compression_type: connection_result.compression_type,
         enable_server_pointer: connection_result.enable_server_pointer,
         pointer_software_rendering: connection_result.pointer_software_rendering,
+        security: connection_result.security,
     }
     .build();
     #[cfg(feature = "udp")]
@@ -7649,6 +7650,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
 
@@ -7723,6 +7725,7 @@ mod tests {
             compression_type: None,
             enable_server_pointer: false,
             pointer_software_rendering: false,
+            security: None,
         }
         .build();
 
