@@ -7,6 +7,8 @@ description = "Standard RDP Security (PROTOCOL_RDP) crypto engine: key schedule,
 
 [dependencies]
 num-bigint = "0.4"
+x509-cert = { version = "0.3", default-features = false, features = ["std"] }
+pkcs1 = { version = "0.7", features = ["std"] }
 md-5 = "0.10"
 sha1 = "0.10"
 digest = "0.10"

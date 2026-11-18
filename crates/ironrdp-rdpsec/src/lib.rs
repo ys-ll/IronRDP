@@ -386,7 +386,29 @@ pub fn encrypt_client_random(server_cert: &[u8], client_random: &[u8]) -> Result
 /// with the public key embedded in the GCC server certificate blob, using
 /// the same raw little-endian modpow convention the wire expects for the
 /// Security Exchange client random.
+///
+/// Both GCC certificate formats are supported: the proprietary "RSA1" blob
+/// (legacy servers) and the X.509 certificate chain (e.g. Server 2003 with a
+/// real certificate bound to the RDP listener). The raw little-endian modpow
+/// convention applies to both — FreeRDP normalizes the X.509 chain the same
+/// way and interoperates with these servers.
 pub fn encrypt_with_server_public_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
+    const CERT_CHAIN_VERSION_MASK: u32 = 0x7fff_ffff;
+    const CERT_CHAIN_VERSION_PROPRIETARY: u32 = 1;
+    const CERT_CHAIN_VERSION_X509: u32 = 2;
+
+    if server_cert.len() < 4 {
+        return Err(SecurityError::CertTruncated);
+    }
+    let version = u32::from_le_bytes(server_cert[..4].try_into().unwrap()) & CERT_CHAIN_VERSION_MASK;
+    match version {
+        CERT_CHAIN_VERSION_PROPRIETARY => encrypt_with_proprietary_key(server_cert, secret),
+        CERT_CHAIN_VERSION_X509 => encrypt_with_x509_chain_key(server_cert, secret),
+        _ => Err(SecurityError::CertNoPublicKey),
+    }
+}
+
+fn encrypt_with_proprietary_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
     const RSA1_MAGIC: &[u8; 4] = b"RSA1";
     let pos = server_cert
         .windows(4)
@@ -422,6 +444,61 @@ pub fn encrypt_with_server_public_key(server_cert: &[u8], secret: &[u8]) -> Resu
     Ok(out)
 }
 
+/// RSA-encrypt `secret` with the RSA public key of the leaf certificate in
+/// the GCC X.509 chain blob (`dwVersion` = 2). The blob layout is
+/// `certCount u32` followed by `certCount` × (`certLen u32` + DER + 8-byte
+/// padding); the last certificate is the server's leaf.
+///
+/// Byte conventions per FreeRDP (`cert_common.c` + `crypto.c`): modulus and
+/// exponent are read big-endian straight out of the DER, the plaintext is
+/// interpreted little-endian and zero-padded to the modulus length, and the
+/// ciphertext comes back little-endian — the same raw-modpow shape the
+/// proprietary path uses.
+fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
+    const CHAIN_HEADER_SIZE: usize = 8; // dwVersion + certCount
+    const CERT_LENGTH_FIELD_SIZE: usize = 4;
+    const X509_PADDING_SIZE: usize = 8;
+
+    let mut offset = CHAIN_HEADER_SIZE;
+    let mut leaf: Option<&[u8]> = None;
+    loop {
+        let cert_len = u32::from_le_bytes(
+            server_cert
+                .get(offset..offset + CERT_LENGTH_FIELD_SIZE)
+                .ok_or(SecurityError::CertTruncated)?
+                .try_into()
+                .unwrap(),
+        ) as usize;
+        offset += CERT_LENGTH_FIELD_SIZE;
+        let cert = server_cert
+            .get(offset..offset + cert_len)
+            .ok_or(SecurityError::CertTruncated)?;
+        offset += cert_len + X509_PADDING_SIZE;
+        leaf = Some(cert);
+        if offset >= server_cert.len() {
+            break;
+        }
+    }
+
+    let leaf = leaf.ok_or(SecurityError::CertTruncated)?;
+    use x509_cert::der::Decode as _;
+    let certificate = x509_cert::Certificate::from_der(leaf)
+        .map_err(|_| SecurityError::CertNoPublicKey)?;
+    let spki = certificate.tbs_certificate().subject_public_key_info();
+    let key = pkcs1::RsaPublicKey::try_from(spki.clone())
+        .map_err(|_| SecurityError::CertNoPublicKey)?;
+
+    let m = num_bigint::BigUint::from_bytes_be(&key.modulus);
+    let e = num_bigint::BigUint::from_bytes_be(&key.public_exponent);
+    let mut block = secret.to_vec();
+    block.resize(key.modulus.len(), 0u8);
+    let b = num_bigint::BigUint::from_bytes_le(&block);
+    let cipher = b.modpow(&e, &m);
+    let mut out = cipher.to_bytes_le();
+    out.resize(key.modulus.len(), 0u8);
+    Ok(out)
+}
+
 /// Errors.
 #[derive(Debug)]
 pub enum SecurityError {
@@ -433,7 +510,7 @@ pub enum SecurityError {
 impl core::fmt::Display for SecurityError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            SecurityError::CertNoPublicKey => write!(f, "server certificate has no RSA1 public key"),
+            SecurityError::CertNoPublicKey => write!(f, "server certificate carries no RSA public key"),
             SecurityError::CertTruncated => write!(f, "server certificate truncated"),
             SecurityError::RandomTooShort => write!(f, "client random shorter than modulus"),
         }
