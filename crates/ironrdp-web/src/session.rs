@@ -28,6 +28,7 @@ use ironrdp::cliprdr::pdu::{FileContentsFlags, FileContentsRequest, FileContents
 use ironrdp::connector::connection_activation::ConnectionActivationState;
 use ironrdp::connector::credssp::{KdcResolution, KerberosConfig};
 use ironrdp::connector::{self, ClientConnector, Credentials};
+use ironrdp::connector::Sequence as _;
 use ironrdp::displaycontrol::client::DisplayControlClient;
 use ironrdp::dvc::DrdynvcClient;
 use ironrdp::graphics::image_processing::PixelFormat;
@@ -40,7 +41,7 @@ use ironrdp::rdpsnd::client::{NoopRdpsndBackend, Rdpsnd};
 use ironrdp::session::image::DecodedImage;
 use ironrdp::session::{ActiveStageBuilder, ActiveStageOutput, GracefulDisconnectReason};
 use ironrdp_core::WriteBuf;
-use ironrdp_futures::{FramedWrite, single_sequence_step_read};
+use ironrdp_futures::FramedWrite;
 use rgb::AsPixels as _;
 use tap::prelude::*;
 use tracing::{debug, error, info, trace, warn};
@@ -1109,12 +1110,30 @@ impl iron_remote_desktop::Session for Session {
                         let mut connection_activation = activation_factory.create();
                         let mut buf = WriteBuf::new();
                         'activation_seq: loop {
-                            let written =
-                                single_sequence_step_read(&mut framed, &mut connection_activation, &mut buf).await?;
+                            // Step the reactivation sequence manually instead of via
+                            // single_sequence_step_read: under Standard RDP Security
+                            // the inbound frames are RC4-encrypted, and feeding the
+                            // raw frame to the sequence (which decrypt_s2c_input
+                            // handles during the initial connect) sends the encrypted
+                            // Demand Active straight into the Share Control decoder.
+                            // Outgoing PDUs need the same treatment via the outbound
+                            // envelope, or the server drops the connection.
+                            buf.clear();
+                            let written = if let Some(next_pdu_hint) = connection_activation.next_pdu_hint() {
+                                let pdu = framed
+                                    .read_by_hint(next_pdu_hint)
+                                    .await
+                                    .map_err(|e| connector::custom_err!("read frame by hint", e))?;
+                                let decrypted = active_stage.decrypt_inbound_frame(ironrdp_pdu::Action::X224, &pdu)?;
+                                connection_activation.step(&decrypted, framed.last_read_at(), &mut buf)?
+                            } else {
+                                connection_activation.step_no_input(&mut buf)?
+                            };
 
                             if written.size().is_some() {
+                                let secured = active_stage.secure_outgoing_frame(buf.filled().to_vec())?;
                                 self.writer_tx
-                                    .unbounded_send(buf.filled().to_vec())
+                                    .unbounded_send(secured)
                                     .context("Send frame to writer task")?;
                             }
 
