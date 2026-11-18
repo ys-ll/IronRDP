@@ -1,3 +1,4 @@
+use core::fmt;
 use core::mem;
 
 use ironrdp_pdu::rdp;
@@ -9,7 +10,7 @@ use tracing::{debug, info, warn};
 
 use crate::{
     Config, ConnectionFinalizationSequence, ConnectorError, ConnectorErrorExt as _, ConnectorResult, DesktopSize,
-    MonotonicInstant, Sequence, State, Written, general_err, reason_err,
+    MonotonicInstant, Sequence, State, Written, custom_err, general_err, reason_err,
 };
 
 /// Represents the Capability Exchange and Connection Finalization phases
@@ -175,8 +176,50 @@ impl Sequence for ConnectionActivationSequence {
 
                 let send_data_indication_ctx =
                     ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-                let share_control_ctx =
-                    rdp::headers::decode_share_control(send_data_indication_ctx).map_err(ConnectorError::decode)?;
+                let share_control_ctx = rdp::headers::decode_share_control(send_data_indication_ctx).map_err(|error| {
+                    // Surface the offending bytes in the error itself: the WASM
+                    // client's tracing does not reach the desktop log, so a failed
+                    // slow-path decode here is otherwise unattributable.
+                    #[derive(Debug)]
+                    struct ShareControlDecodeDiagnostics {
+                        user_data_len: usize,
+                        head_hex: String,
+                        source: ironrdp_core::DecodeError,
+                    }
+
+                    impl fmt::Display for ShareControlDecodeDiagnostics {
+                        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                            write!(
+                                f,
+                                "Share Control PDU decode failed ({} bytes, head: {})",
+                                self.user_data_len, self.head_hex
+                            )
+                        }
+                    }
+
+                    impl core::error::Error for ShareControlDecodeDiagnostics {
+                        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                            Some(&self.source)
+                        }
+                    }
+
+                    let user_data = send_data_indication_ctx.user_data;
+                    let head_hex = user_data
+                        .iter()
+                        .take(96)
+                        .map(|byte| format!("{byte:02X}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+
+                    custom_err!(
+                        "CapabilitiesExchange",
+                        ShareControlDecodeDiagnostics {
+                            user_data_len: user_data.len(),
+                            head_hex,
+                            source: error,
+                        }
+                    )
+                })?;
 
                 debug!(message = ?share_control_ctx.pdu, "Received");
 
