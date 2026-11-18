@@ -14,7 +14,14 @@ const SERVER_ENCRYPTION_LEVEL_SIZE: usize = 4;
 const SERVER_RANDOM_LEN_SIZE: usize = 4;
 const SERVER_CERT_LEN_SIZE: usize = 4;
 const SERVER_RANDOM_LEN: usize = 0x20;
-const MAX_SERVER_CERT_LEN: usize = 1024;
+// No absolute cap on serverCertLen: MS-RDPBCGR bounds the Server Security
+// Data by the GCC block, and real servers (e.g. Server 2003) send certificate
+// blobs beyond the 1024 bytes the previous check allowed, failing legitimate
+// connections with "Invalid server certificate length". Validity is enforced
+// by `ensure_size!` below, which requires the whole blob to fit in the
+// remaining input — a bogus length fails with its actual value in the
+// "not enough bytes" message instead, and no oversized allocation can happen
+// because the input is already a fixed slice. FreeRDP validates the same way.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(feature = "arbitrary", derive(arbitrary::Arbitrary))]
@@ -176,10 +183,6 @@ impl<'de> Decode<'de> for ServerSecurityData {
             }
 
             let server_cert_len = cast_length!("serverCertLen", src.read_u32(), in: src)?;
-
-            if server_cert_len > MAX_SERVER_CERT_LEN {
-                return Err(invalid_field_err!("serverCetLen", "Invalid server certificate length", in: src));
-            }
 
             ensure_size!(in: src, size: SERVER_RANDOM_LEN);
             let server_random = src.read_array();
