@@ -485,18 +485,86 @@ fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<
     let certificate = x509_cert::Certificate::from_der(leaf)
         .map_err(|_| SecurityError::CertNoPublicKey)?;
     let spki = certificate.tbs_certificate().subject_public_key_info();
-    let key = pkcs1::RsaPublicKey::try_from(spki.clone())
-        .map_err(|_| SecurityError::CertNoPublicKey)?;
 
-    let m = num_bigint::BigUint::from_bytes_be(&key.modulus);
-    let e = num_bigint::BigUint::from_bytes_be(&key.public_exponent);
+    // The subjectPublicKeyInfo BIT STRING wraps an RSAPublicKey DER SEQUENCE
+    // (`SEQUENCE { INTEGER modulus, INTEGER publicExponent }`, one leading
+    // zero byte marks zero unused bits). Parsed with a minimal DER walker:
+    // the structure is fixed and this keeps the crate's dependency footprint
+    // unchanged.
+    let bits = spki
+        .subject_public_key
+        .as_bytes()
+        .ok_or(SecurityError::CertNoPublicKey)?;
+    let rsa_der = bits.strip_prefix(&[0u8]).ok_or(SecurityError::CertNoPublicKey)?;
+    let (modulus, exponent) = parse_rsa_public_key(rsa_der)?;
+
+    let m = num_bigint::BigUint::from_bytes_be(modulus);
+    let e = num_bigint::BigUint::from_bytes_be(exponent);
     let mut block = secret.to_vec();
-    block.resize(key.modulus.len(), 0u8);
+    block.resize(modulus.len(), 0u8);
     let b = num_bigint::BigUint::from_bytes_le(&block);
     let cipher = b.modpow(&e, &m);
     let mut out = cipher.to_bytes_le();
-    out.resize(key.modulus.len(), 0u8);
+    out.resize(modulus.len(), 0u8);
     Ok(out)
+}
+
+/// Reads one DER TLV at `offset`, returning `(tag, value)` and advancing
+/// `offset` past the whole element.
+fn read_der_tlv<'a>(data: &'a [u8], offset: &mut usize) -> Result<(u8, &'a [u8]), SecurityError> {
+    let tag = *data.get(*offset).ok_or(SecurityError::CertTruncated)?;
+    *offset += 1;
+    let length_byte = *data.get(*offset).ok_or(SecurityError::CertTruncated)?;
+    *offset += 1;
+    let length = if length_byte & 0x80 == 0 {
+        length_byte as usize
+    } else {
+        let count = (length_byte & 0x7f) as usize;
+        if count == 0 || count > 4 {
+            return Err(SecurityError::CertTruncated);
+        }
+        let mut length = 0usize;
+        for _ in 0..count {
+            length = (length << 8) | *data.get(*offset).ok_or(SecurityError::CertTruncated)? as usize;
+            *offset += 1;
+        }
+        length
+    };
+    let value = data.get(*offset..*offset + length).ok_or(SecurityError::CertTruncated)?;
+    *offset += length;
+    Ok((tag, value))
+}
+
+/// Extracts `(modulus, exponent)` from an `RSAPublicKey` DER SEQUENCE
+/// (`SEQUENCE { INTEGER modulus, INTEGER publicExponent }`).
+fn parse_rsa_public_key(der: &[u8]) -> Result<(&[u8], &[u8]), SecurityError> {
+    let mut offset = 0;
+    let (tag, sequence) = read_der_tlv(der, &mut offset)?;
+    if tag != 0x30 {
+        return Err(SecurityError::CertNoPublicKey);
+    }
+
+    let mut offset = 0;
+    let (tag, modulus) = read_der_tlv(sequence, &mut offset)?;
+    if tag != 0x02 {
+        return Err(SecurityError::CertNoPublicKey);
+    }
+    // A positive INTEGER may carry a leading zero byte for the sign bit.
+    let modulus = modulus.strip_prefix(&[0u8]).unwrap_or(modulus);
+    if modulus.is_empty() {
+        return Err(SecurityError::CertNoPublicKey);
+    }
+
+    let (tag, exponent) = read_der_tlv(sequence, &mut offset)?;
+    if tag != 0x02 {
+        return Err(SecurityError::CertNoPublicKey);
+    }
+    let exponent = exponent.strip_prefix(&[0u8]).unwrap_or(exponent);
+    if exponent.is_empty() || exponent.len() > 4 {
+        return Err(SecurityError::CertNoPublicKey);
+    }
+
+    Ok((modulus, exponent))
 }
 
 /// Errors.

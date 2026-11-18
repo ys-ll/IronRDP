@@ -3451,7 +3451,6 @@ dependencies = [
  "digest 0.10.7",
  "md-5 0.10.6",
  "num-bigint",
- "pkcs1 0.7.5",
  "sha1 0.10.7",
  "x509-cert",
 ]
