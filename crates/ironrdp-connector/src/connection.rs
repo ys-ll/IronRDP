@@ -2363,13 +2363,15 @@ impl ClientConnector {
             return Ok(Cow::Borrowed(input));
         };
 
-        let x224 = match decode::<X224<mcs::McsMessage<'_>>>(input) {
-            Ok(x224) => x224,
+        // Parse with the same helper the downstream states use (licensing and
+        // the activation sequence both decode their PDUs straight from the
+        // raw frame). The previous `decode::<X224<McsMessage>>` attempt did
+        // not accept the framed shape and silently passed encrypted PDUs
+        // through, so the first encrypted slow-path PDU (Server Demand Active)
+        // reached the state machine as ciphertext.
+        let data = match mcs::decode_send_data_indication(input) {
+            Ok(ctx) => ctx,
             Err(_) => return Ok(Cow::Borrowed(input)),
-        };
-
-        let mcs::McsMessage::SendDataIndication(mut data) = x224.0 else {
-            return Ok(Cow::Borrowed(input));
         };
 
         let payload = if data.user_data.len() >= 4 {
@@ -2411,10 +2413,12 @@ impl ClientConnector {
                 if is_license_phase && !is_message_channel {
                     return Ok(Cow::Borrowed(input));
                 }
-                if data.user_data.len() >= BASIC_SECURITY_HEADER_SIZE {
-                    data.user_data = Cow::Owned(data.user_data[BASIC_SECURITY_HEADER_SIZE..].to_vec());
-                }
-                data.user_data.into_owned()
+                let body = if data.user_data.len() >= BASIC_SECURITY_HEADER_SIZE {
+                    &data.user_data[BASIC_SECURITY_HEADER_SIZE..]
+                } else {
+                    data.user_data
+                };
+                body.to_vec()
             }
         } else {
             return Ok(Cow::Borrowed(input));
