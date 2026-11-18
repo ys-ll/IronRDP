@@ -43,10 +43,38 @@ impl ClientLicenseInfo {
         hardware_data: [u32; 4],
         license_info: Vec<u8>,
     ) -> Result<(Self, LicenseEncryptionData), ServerLicenseError> {
-        let public_key = license_request.get_public_key()?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
-                                          "attempted to retrieve the server public key from a server license request message that does not have a certificate"))?;
-        let encrypted_premaster_secret = encrypt_with_public_key(premaster_secret, &public_key)?;
+        Self::from_server_license_request_with_premaster(
+            license_request,
+            None,
+            client_random,
+            premaster_secret,
+            hardware_data,
+            license_info,
+        )
+    }
+
+    /// Builds the license info from a premaster secret that is already
+    /// encrypted. See
+    /// [`ClientNewLicenseRequest::from_server_license_request_with_premaster`]
+    /// for when the caller supplies the ciphertext (Standard RDP Security
+    /// servers send no certificate in the license request).
+    pub fn from_server_license_request_with_premaster(
+        license_request: &ServerLicenseRequest,
+        encrypted_premaster_secret: Option<Vec<u8>>,
+        client_random: &[u8],
+        premaster_secret: &[u8],
+        hardware_data: [u32; 4],
+        license_info: Vec<u8>,
+    ) -> Result<(Self, LicenseEncryptionData), ServerLicenseError> {
+        let encrypted_premaster_secret = match encrypted_premaster_secret {
+            Some(encrypted) => encrypted,
+            None => {
+                let public_key = license_request.get_public_key()?
+                    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData,
+                                                  "attempted to retrieve the server public key from a server license request message that does not have a certificate"))?;
+                encrypt_with_public_key(premaster_secret, &public_key)?
+            }
+        };
 
         let master_secret = compute_master_secret(
             premaster_secret,

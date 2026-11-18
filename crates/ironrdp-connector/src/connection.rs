@@ -1960,6 +1960,10 @@ impl Sequence for ClientConnector {
                         .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
                 );
                 license_exchange.security = self.security.clone();
+                license_exchange.server_cert = self
+                    .server_security
+                    .as_ref()
+                    .map(|s| s.server_cert.clone());
                 // If a PDU was read (message channel present) it is the first
                 // licensing PDU; advance the licensing sequence with it now,
                 // through the same helper the LicensingExchange state uses, so

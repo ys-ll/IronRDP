@@ -379,6 +379,14 @@ pub type SharedSecurity = std::sync::Arc<std::sync::Mutex<RdpSecurity>>;
 /// **little-endian** on the wire; the plaintext block is client_random (32B)
 /// zero-padded to the modulus length — no PKCS#1 padding.
 pub fn encrypt_client_random(server_cert: &[u8], client_random: &[u8]) -> Result<Vec<u8>, SecurityError> {
+    encrypt_with_server_public_key(server_cert, client_random)
+}
+
+/// RSA-encrypt a small secret (client random, licensing premaster secret)
+/// with the public key embedded in the GCC server certificate blob, using
+/// the same raw little-endian modpow convention the wire expects for the
+/// Security Exchange client random.
+pub fn encrypt_with_server_public_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
     const RSA1_MAGIC: &[u8; 4] = b"RSA1";
     let pos = server_cert
         .windows(4)
@@ -405,7 +413,7 @@ pub fn encrypt_client_random(server_cert: &[u8], client_random: &[u8]) -> Result
 
     let m = num_bigint::BigUint::from_bytes_le(modulus);
     let e = num_bigint::BigUint::from(pub_exp);
-    let mut block = client_random.to_vec();
+    let mut block = secret.to_vec();
     block.resize(mod_len, 0u8);
     let b = num_bigint::BigUint::from_bytes_le(&block);
     let cipher = b.modpow(&e, &m);

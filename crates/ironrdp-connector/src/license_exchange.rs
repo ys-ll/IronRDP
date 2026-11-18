@@ -72,6 +72,11 @@ pub struct LicenseExchangeSequence {
     /// Standard RDP Security cryptor, carried over from the connector when the
     /// GCC exchange selected the standard path. `None` otherwise.
     pub security: Option<SharedSecurity>,
+    /// Raw GCC server certificate blob (the same key the Security Exchange
+    /// RSA-encrypted the client random with). Standard RDP Security servers
+    /// send the license request without a certificate; this blob encrypts the
+    /// licensing premaster secret then. `None` on enhanced-security paths.
+    pub server_cert: Option<Vec<u8>>,
 }
 
 // Use RefUnwindSafe so that types that embed LicenseCache remain UnwindSafe
@@ -109,6 +114,7 @@ impl LicenseExchangeSequence {
             hardware_id,
             license_cache,
             security: None,
+            server_cert: None,
         }
     }
 
@@ -192,6 +198,30 @@ impl Sequence for LicenseExchangeSequence {
                         let mut premaster_secret = [0u8; server_license::PREMASTER_SECRET_SIZE];
                         rng.fill_bytes(&mut premaster_secret);
 
+                        // Standard RDP Security: Windows sends the license request
+                        // without a certificate blob. There the premaster secret is
+                        // RSA-encrypted with the GCC server certificate's public key
+                        // instead (the same connection-level certificate the Security
+                        // Exchange used); FreeRDP falls back to the connection-level
+                        // certificate the same way.
+                        let encrypted_premaster = if license_request
+                            .get_public_key()
+                            .map_err(|e| custom_err!("license request public key", e))?
+                            .is_none()
+                        {
+                            let server_cert = self.server_cert.as_ref().ok_or_else(|| {
+                                general_err!(
+                                    "server license request carries no certificate and the connection has no GCC server certificate",
+                                )
+                            })?;
+                            Some(
+                                ironrdp_rdpsec::encrypt_with_server_public_key(server_cert, &premaster_secret)
+                                    .map_err(|e| custom_err!("license premaster encryption", e))?,
+                            )
+                        } else {
+                            None
+                        };
+
                         let license_info = license_request
                             .scope_list
                             .iter()
@@ -210,8 +240,9 @@ impl Sequence for LicenseExchangeSequence {
                             .transpose()?;
 
                         if let Some(info) = license_info {
-                            match server_license::ClientLicenseInfo::from_server_license_request(
+                            match server_license::ClientLicenseInfo::from_server_license_request_with_premaster(
                                 &license_request,
+                                encrypted_premaster.clone(),
                                 &client_random,
                                 &premaster_secret,
                                 self.hardware_id,
@@ -242,8 +273,9 @@ impl Sequence for LicenseExchangeSequence {
                             }
                         } else {
                             let hwid = self.hardware_id;
-                            match server_license::ClientNewLicenseRequest::from_server_license_request(
+                            match server_license::ClientNewLicenseRequest::from_server_license_request_with_premaster(
                                 &license_request,
+                                encrypted_premaster,
                                 &client_random,
                                 &premaster_secret,
                                 &self.username,
