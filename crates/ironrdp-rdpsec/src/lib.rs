@@ -398,40 +398,72 @@ pub fn encrypt_with_server_public_key(server_cert: &[u8], secret: &[u8]) -> Resu
     const CERT_CHAIN_VERSION_X509: u32 = 2;
 
     if server_cert.len() < 4 {
-        return Err(SecurityError::CertTruncated);
+        return Err(SecurityError::CertTruncated(format!(
+            "blob is {} bytes, too short for the dwVersion field",
+            server_cert.len()
+        )));
     }
-    let version = u32::from_le_bytes(server_cert[..4].try_into().unwrap()) & CERT_CHAIN_VERSION_MASK;
+    let raw_version = u32::from_le_bytes(server_cert[..4].try_into().unwrap());
+    let version = raw_version & CERT_CHAIN_VERSION_MASK;
     match version {
         CERT_CHAIN_VERSION_PROPRIETARY => encrypt_with_proprietary_key(server_cert, secret),
         CERT_CHAIN_VERSION_X509 => encrypt_with_x509_chain_key(server_cert, secret),
-        _ => Err(SecurityError::CertNoPublicKey),
+        _ => Err(SecurityError::CertNoPublicKey(format!(
+            "unsupported certificate format version 0x{raw_version:08X}; {}",
+            cert_blob_head(server_cert)
+        ))),
     }
+}
+
+/// One-line diagnostic head for the certificate blob: size plus the first 32
+/// bytes in hex. Appended to every parse failure so a failing Security
+/// Exchange can be attributed from the desktop log alone (the WASM client's
+/// tracing does not reach it).
+fn cert_blob_head(blob: &[u8]) -> String {
+    let head: Vec<String> = blob.iter().take(32).map(|byte| format!("{byte:02X}")).collect();
+    format!("blob {}B head {}", blob.len(), head.join(" "))
 }
 
 fn encrypt_with_proprietary_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
     const RSA1_MAGIC: &[u8; 4] = b"RSA1";
+    let head = cert_blob_head(server_cert);
     let pos = server_cert
         .windows(4)
         .position(|w| w == RSA1_MAGIC)
-        .ok_or(SecurityError::CertNoPublicKey)?;
+        .ok_or_else(|| {
+            SecurityError::CertNoPublicKey(format!("no RSA1 key blob found (dwVersion 1); {head}"))
+        })?;
     let key_len = u32::from_le_bytes(
         server_cert
             .get(pos + 4..pos + 8)
-            .ok_or(SecurityError::CertTruncated)?
+            .ok_or_else(|| {
+                SecurityError::CertTruncated(format!("RSA1 keyLen overruns the blob at offset {}; {head}", pos + 4))
+            })?
             .try_into()
             .unwrap(),
     ) as usize;
     let pub_exp = u32::from_le_bytes(
         server_cert
             .get(pos + 16..pos + 20)
-            .ok_or(SecurityError::CertTruncated)?
+            .ok_or_else(|| {
+                SecurityError::CertTruncated(format!(
+                    "RSA1 public exponent overruns the blob at offset {}; {head}",
+                    pos + 16
+                ))
+            })?
             .try_into()
             .unwrap(),
     );
     let mod_len = key_len - 8;
     let modulus = server_cert
         .get(pos + 20..pos + 20 + mod_len)
-        .ok_or(SecurityError::CertTruncated)?;
+        .ok_or_else(|| {
+            SecurityError::CertTruncated(format!(
+                "RSA1 modulus ({} bytes) overruns the blob at offset {}; {head}",
+                mod_len,
+                pos + 20
+            ))
+        })?;
 
     let m = num_bigint::BigUint::from_bytes_le(modulus);
     let e = num_bigint::BigUint::from(pub_exp);
@@ -457,6 +489,7 @@ fn encrypt_with_proprietary_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec
 fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
     const CHAIN_HEADER_SIZE: usize = 8; // dwVersion + numCertBlobs
     const CERT_LENGTH_FIELD_SIZE: usize = 4;
+    let head = cert_blob_head(server_cert);
 
     // [MS-RDPBCGR 2.2.1.4.3.1.1.2] X.509 Certificate Chain: numCertBlobs
     // followed by numCertBlobs × (certLen + certData) laid out back to back —
@@ -464,49 +497,83 @@ fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<
     // certificate_chain walks them the same way). The last certificate is the
     // Terminal Server certificate whose key encrypts the client random.
     if server_cert.len() < CHAIN_HEADER_SIZE {
-        return Err(SecurityError::CertTruncated);
+        return Err(SecurityError::CertTruncated(format!(
+            "blob is {} bytes, too short for dwVersion + numCertBlobs; {head}",
+            server_cert.len()
+        )));
     }
-    let cert_count =
-        u32::from_le_bytes(server_cert[4..8].try_into().unwrap()) as usize;
+    let cert_count = u32::from_le_bytes(server_cert[4..8].try_into().unwrap()) as usize;
     if cert_count == 0 {
-        return Err(SecurityError::CertNoPublicKey);
+        return Err(SecurityError::CertNoPublicKey(format!(
+            "X.509 chain carries zero certificates; {head}"
+        )));
     }
 
     let mut offset = CHAIN_HEADER_SIZE;
-    let mut leaf: Option<&[u8]> = None;
-    for _ in 0..cert_count {
+    let mut chain_lengths = Vec::with_capacity(cert_count);
+    let mut leaf: &[u8] = &[];
+    let mut leaf_offset = 0usize;
+    for index in 0..cert_count {
         let cert_len = u32::from_le_bytes(
             server_cert
                 .get(offset..offset + CERT_LENGTH_FIELD_SIZE)
-                .ok_or(SecurityError::CertTruncated)?
+                .ok_or_else(|| {
+                    SecurityError::CertTruncated(format!(
+                        "certificate #{} of {} has no room for its length field at offset {} ({}-byte blob); {}",
+                        index + 1,
+                        cert_count,
+                        offset,
+                        server_cert.len(),
+                        head
+                    ))
+                })?
                 .try_into()
                 .unwrap(),
         ) as usize;
         offset += CERT_LENGTH_FIELD_SIZE;
         let cert = server_cert
             .get(offset..offset + cert_len)
-            .ok_or(SecurityError::CertTruncated)?;
+            .ok_or_else(|| {
+                SecurityError::CertTruncated(format!(
+                    "certificate #{} of {} ({} bytes at offset {}) overruns the {}-byte blob; {}",
+                    index + 1,
+                    cert_count,
+                    cert_len,
+                    offset,
+                    server_cert.len(),
+                    head
+                ))
+            })?;
         offset += cert_len;
-        leaf = Some(cert);
+        chain_lengths.push(cert_len);
+        leaf = cert;
+        leaf_offset = offset - cert_len;
     }
 
-    let leaf = leaf.ok_or(SecurityError::CertTruncated)?;
     use x509_cert::der::Decode as _;
-    let certificate = x509_cert::Certificate::from_der(leaf)
-        .map_err(|_| SecurityError::CertNoPublicKey)?;
+    let certificate = x509_cert::Certificate::from_der(leaf).map_err(|error| {
+        SecurityError::CertNoPublicKey(format!(
+            "leaf X.509 certificate ({} bytes at offset {}) failed to parse: {error}; chain lengths {chain_lengths:?}; {head}",
+            leaf.len(),
+            leaf_offset
+        ))
+    })?;
     let spki = certificate.tbs_certificate().subject_public_key_info();
 
     // The subjectPublicKeyInfo BIT STRING wraps an RSAPublicKey DER SEQUENCE
-    // (`SEQUENCE { INTEGER modulus, INTEGER publicExponent }`, one leading
-    // zero byte marks zero unused bits). Parsed with a minimal DER walker:
-    // the structure is fixed and this keeps the crate's dependency footprint
-    // unchanged.
-    let bits = spki
+    // (`SEQUENCE { INTEGER modulus, INTEGER publicExponent }`). der's
+    // `as_bytes` returns None while unused bits are present and excludes the
+    // unused-bits octet otherwise — the RSAPublicKey follows immediately.
+    let rsa_der = spki
         .subject_public_key
         .as_bytes()
-        .ok_or(SecurityError::CertNoPublicKey)?;
-    let rsa_der = bits.strip_prefix(&[0u8]).ok_or(SecurityError::CertNoPublicKey)?;
-    let (modulus, exponent) = parse_rsa_public_key(rsa_der)?;
+        .ok_or_else(|| {
+            SecurityError::CertNoPublicKey(format!(
+                "leaf certificate SPKI BIT STRING carries unused bits; chain lengths {chain_lengths:?}; {head}"
+            ))
+        })?;
+    let (modulus, exponent) = parse_rsa_public_key(rsa_der, &head)
+        .map_err(|error| SecurityError::CertNoPublicKey(format!("{error}; {head}")))?;
 
     let m = num_bigint::BigUint::from_bytes_be(modulus);
     let e = num_bigint::BigUint::from_bytes_be(exponent);
@@ -521,57 +588,97 @@ fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<
 
 /// Reads one DER TLV at `offset`, returning `(tag, value)` and advancing
 /// `offset` past the whole element.
-fn read_der_tlv<'a>(data: &'a [u8], offset: &mut usize) -> Result<(u8, &'a [u8]), SecurityError> {
-    let tag = *data.get(*offset).ok_or(SecurityError::CertTruncated)?;
+fn read_der_tlv<'a>(
+    data: &'a [u8],
+    offset: &mut usize,
+    what: &'static str,
+    context: &str,
+) -> Result<(u8, &'a [u8]), SecurityError> {
+    let len = data.len();
+    let tag = *data.get(*offset).ok_or_else(|| {
+        SecurityError::CertTruncated(format!(
+            "expected the {what} at offset {offset} but the {}-byte buffer ended; {context}",
+            len
+        ))
+    })?;
     *offset += 1;
-    let length_byte = *data.get(*offset).ok_or(SecurityError::CertTruncated)?;
+    let length_byte = *data.get(*offset).ok_or_else(|| {
+        SecurityError::CertTruncated(format!(
+            "expected the {what} length byte at offset {offset} but the {}-byte buffer ended; {context}",
+            len
+        ))
+    })?;
     *offset += 1;
     let length = if length_byte & 0x80 == 0 {
         length_byte as usize
     } else {
         let count = (length_byte & 0x7f) as usize;
         if count == 0 || count > 4 {
-            return Err(SecurityError::CertTruncated);
+            return Err(SecurityError::CertTruncated(format!(
+                "unsupported DER length form ({} length bytes) for the {what} at offset {}; {context}",
+                count,
+                *offset - 1
+            )));
         }
         let mut length = 0usize;
         for _ in 0..count {
-            length = (length << 8) | *data.get(*offset).ok_or(SecurityError::CertTruncated)? as usize;
+            length = (length << 8) | *data.get(*offset).ok_or(SecurityError::CertTruncated(format!(
+                "DER length bytes for the {what} overrun the {}-byte buffer at offset {}; {context}",
+                len, offset
+            )))? as usize;
             *offset += 1;
         }
         length
     };
-    let value = data.get(*offset..*offset + length).ok_or(SecurityError::CertTruncated)?;
+    let value = data.get(*offset..*offset + length).ok_or_else(|| {
+        SecurityError::CertTruncated(format!(
+            "the {what} ({length} bytes at offset {}) overruns the {}-byte buffer; {context}",
+            offset, len
+        ))
+    })?;
     *offset += length;
     Ok((tag, value))
 }
 
 /// Extracts `(modulus, exponent)` from an `RSAPublicKey` DER SEQUENCE
 /// (`SEQUENCE { INTEGER modulus, INTEGER publicExponent }`).
-fn parse_rsa_public_key(der: &[u8]) -> Result<(&[u8], &[u8]), SecurityError> {
+fn parse_rsa_public_key<'a>(der: &'a [u8], context: &str) -> Result<(&'a [u8], &'a [u8]), SecurityError> {
     let mut offset = 0;
-    let (tag, sequence) = read_der_tlv(der, &mut offset)?;
+    let (tag, sequence) = read_der_tlv(der, &mut offset, "RSAPublicKey SEQUENCE", context)?;
     if tag != 0x30 {
-        return Err(SecurityError::CertNoPublicKey);
+        return Err(SecurityError::CertNoPublicKey(format!(
+            "expected the RSAPublicKey SEQUENCE but found tag 0x{tag:02X}; {context}"
+        )));
     }
 
     let mut offset = 0;
-    let (tag, modulus) = read_der_tlv(sequence, &mut offset)?;
+    let (tag, modulus) = read_der_tlv(sequence, &mut offset, "modulus INTEGER", context)?;
     if tag != 0x02 {
-        return Err(SecurityError::CertNoPublicKey);
+        return Err(SecurityError::CertNoPublicKey(format!(
+            "expected the modulus INTEGER but found tag 0x{tag:02X}; {context}"
+        )));
     }
-    // A positive INTEGER may carry a leading zero byte for the sign bit.
+    // A positive INTEGER may carry a leading zero byte for the sign bit
+    // (FreeRDP skips all leading zeros for the same reason).
     let modulus = modulus.strip_prefix(&[0u8]).unwrap_or(modulus);
     if modulus.is_empty() {
-        return Err(SecurityError::CertNoPublicKey);
+        return Err(SecurityError::CertNoPublicKey(format!(
+            "the modulus INTEGER is empty; {context}"
+        )));
     }
 
-    let (tag, exponent) = read_der_tlv(sequence, &mut offset)?;
+    let (tag, exponent) = read_der_tlv(sequence, &mut offset, "public exponent INTEGER", context)?;
     if tag != 0x02 {
-        return Err(SecurityError::CertNoPublicKey);
+        return Err(SecurityError::CertNoPublicKey(format!(
+            "expected the public exponent INTEGER but found tag 0x{tag:02X}; {context}"
+        )));
     }
     let exponent = exponent.strip_prefix(&[0u8]).unwrap_or(exponent);
     if exponent.is_empty() || exponent.len() > 4 {
-        return Err(SecurityError::CertNoPublicKey);
+        return Err(SecurityError::CertNoPublicKey(format!(
+            "the public exponent INTEGER is {} bytes, expected 1-4; {context}",
+            exponent.len()
+        )));
     }
 
     Ok((modulus, exponent))
@@ -580,16 +687,23 @@ fn parse_rsa_public_key(der: &[u8]) -> Result<(&[u8], &[u8]), SecurityError> {
 /// Errors.
 #[derive(Debug)]
 pub enum SecurityError {
-    CertNoPublicKey,
-    CertTruncated,
+    /// No RSA public key could be recovered from the server certificate blob.
+    /// The payload carries the blob size, format version and parse position so
+    /// the failure can be attributed from the desktop log alone.
+    CertNoPublicKey(String),
+    /// A structure overran the certificate blob. The payload carries the blob
+    /// size, the failing offset and a hex head of the blob.
+    CertTruncated(String),
     RandomTooShort,
 }
 
 impl core::fmt::Display for SecurityError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            SecurityError::CertNoPublicKey => write!(f, "server certificate carries no RSA public key"),
-            SecurityError::CertTruncated => write!(f, "server certificate truncated"),
+            SecurityError::CertNoPublicKey(message) => {
+                write!(f, "server certificate carries no RSA public key ({message})")
+            }
+            SecurityError::CertTruncated(message) => write!(f, "server certificate truncated ({message})"),
             SecurityError::RandomTooShort => write!(f, "client random shorter than modulus"),
         }
     }
@@ -702,5 +816,105 @@ mod tests {
             let up = server.encrypt(&pt);
             assert_eq!(client.decrypt(&up), pt, "c2s iteration {i}");
         }
+    }
+}
+
+/// Fixed RSA-2048 key material generated with OpenSSL for the tests: the
+/// X.509 certificate DER, the modulus (big-endian, no DER sign byte) and the
+/// private exponent used to recover the secret on the other side.
+const TEST_CERT_DER_HEX: &str = "3082030d308201f5a00302010202144f78e76f54a92e91ad7d9e0515719eb7ac6ac174300d06092a864886f70d01010b050030163114301206035504030c0b7264707365632d74657374301e170d3236313131393031343132395a170d3336313131363031343132395a30163114301206035504030c0b7264707365632d7465737430820122300d06092a864886f70d01010105000382010f003082010a0282010100b533e82804e1f7cf9a5bdb827e3deaaf178cbcc927b54d2288c580602f13966e5a03645c040b2d0efc3bed37e3a1b488de7a0d7105ae28975641f2e563f9a646de7af9c1b0f88c097d6f540889d1670eacef0a668d02971e446f35ca930fe11063f965bab49b852cfc922e83de403442e925093195aac0d6fbcf1879bfcd6082d265b50c8dc1d2e7d0694638a92fd98fb722e45d8a0964b16226ed1e87778e58285583f5fd89033e434741f847325558502c1f67f3e02371847903264d5345b458b27a7ab97e35427e2a5d0276bb1707c5e53709ec562aa3b8f65ab384ce4e56ee0b82a3e36570c8e38c372f23e19a6c86dd8270758768e1e7a9e9bd233a36230203010001a3533051301d0603551d0e041604140e84db0b172bc9cdfe3cf1b6018971509c98c752301f0603551d230418301680140e84db0b172bc9cdfe3cf1b6018971509c98c752300f0603551d130101ff040530030101ff300d06092a864886f70d01010b05000382010100626881f49af3ff317ad6c6f255433c6a7c40685dad536f357a14a07b6693eefcfc8ae8a873d76b5148ffdd97e9788211303a308002454642ed0ae14a3ff3ff3c2449e20f320846253b29a76b80d9fc575dab257dc476a5a54490ade8979a71cc719149e8549248f0fc4a2dd445b223c90c60fa458f7e3303ef4e97c83d85e1a898dcd39bd0574848c8b270a8bf734e035e6202854e14d3f0003f81ef2d3702a2ff445e82e5d13bf2cbc0ab8e3b5608a6602d0a84ef99d27ea4b1eba95f6fa005ffb154cf8dec60c003484a64c39e92bfd231b5dda1351115fefbc6de06fae0c727b1c672cfe2ec66d9ccf6d515c8131268eb03ae4c91a6e93dca19034c380395";
+const TEST_N_HEX: &str = "b533e82804e1f7cf9a5bdb827e3deaaf178cbcc927b54d2288c580602f13966e5a03645c040b2d0efc3bed37e3a1b488de7a0d7105ae28975641f2e563f9a646de7af9c1b0f88c097d6f540889d1670eacef0a668d02971e446f35ca930fe11063f965bab49b852cfc922e83de403442e925093195aac0d6fbcf1879bfcd6082d265b50c8dc1d2e7d0694638a92fd98fb722e45d8a0964b16226ed1e87778e58285583f5fd89033e434741f847325558502c1f67f3e02371847903264d5345b458b27a7ab97e35427e2a5d0276bb1707c5e53709ec562aa3b8f65ab384ce4e56ee0b82a3e36570c8e38c372f23e19a6c86dd8270758768e1e7a9e9bd233a3623";
+const TEST_D_HEX: &str = "4c4eeab287b3dd9748caec3b1d0cd81b1a50c363f6dbebfae21c423ebf3481824157f258a9bf471f6b6b952f97260f102098c7b6540d0ebd04af4b29fd1b3241e0096bca7ccb7eb5b46440c043c1b2a3c481fa204bbbce86098dc7da626a2a7eab8b68a2e2d227985558fe4bbc39cf886a0495c592e0d0caf84a33657a37742f8cf9fdebb8ab7d90efb3b3bf38e5f3d0beb8eea339a03a8fb9ac42d81ed5d904f2ea5130cd1d79e4f4d237f8b76a934d1e4d1d065f497a6666f44ab62bcab21f2bbebe208e508fd8ca97fa0ab09437e6b4ac86b9e24104f6770a0df5e269f322cea3ac09000e2222d683b2170760dba5703bc76de2a770045f61466acf22c571";
+
+fn unhex(hex: &str) -> Vec<u8> {
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+
+#[cfg(test)]
+mod x509_tests {
+    use super::*;
+
+    /// Builds an X.509 chain blob (dwVersion = 2) carrying one certificate.
+    fn x509_chain_blob(cert_der: &[u8]) -> Vec<u8> {
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&2u32.to_le_bytes());
+        blob.extend_from_slice(&1u32.to_le_bytes());
+        blob.extend_from_slice(&(cert_der.len() as u32).to_le_bytes());
+        blob.extend_from_slice(cert_der);
+        blob
+    }
+
+    /// The X.509 chain path must round-trip under the wire's little-endian
+    /// modpow convention: whatever the client encrypts with the leaf key, the
+    /// private-key holder recovers byte for byte.
+    #[test]
+    fn x509_chain_round_trip() {
+        let cert_der = unhex(TEST_CERT_DER_HEX);
+        let blob = x509_chain_blob(&cert_der);
+        let secret: Vec<u8> = (0..32u8).collect();
+        let cipher = encrypt_with_server_public_key(&blob, &secret).expect("encrypt must succeed on a valid X.509 chain");
+
+        let n = num_bigint::BigUint::from_bytes_be(&unhex(TEST_N_HEX));
+        let d = num_bigint::BigUint::from_bytes_be(&unhex(TEST_D_HEX));
+        let c = num_bigint::BigUint::from_bytes_le(&cipher);
+        let x = c.modpow(&d, &n);
+        let recovered = x.to_bytes_le();
+        assert_eq!(&recovered[..secret.len()], &secret[..]);
+    }
+
+    /// The proprietary RSA1 path must round-trip the same way (the blob's
+    /// modulus is stored little-endian on the wire).
+    #[test]
+    fn proprietary_round_trip() {
+        let n = num_bigint::BigUint::from_bytes_be(&unhex(TEST_N_HEX));
+        let n_wire_le = n.to_bytes_le();
+
+        let mut blob = Vec::new();
+        blob.extend_from_slice(&1u32.to_le_bytes()); // dwVersion = proprietary
+        blob.extend_from_slice(b"RSA1");
+        blob.extend_from_slice(&((n_wire_le.len() + 8) as u32).to_le_bytes()); // keyLen
+        blob.extend_from_slice(&((n_wire_le.len() * 8) as u32).to_le_bytes()); // bitLen
+        blob.extend_from_slice(&((n_wire_le.len() - 1) as u32).to_le_bytes()); // dataLen
+        blob.extend_from_slice(&65537u32.to_le_bytes()); // pubExp
+        blob.extend_from_slice(&n_wire_le); // modulus
+
+        let secret: Vec<u8> = (0..32u8).collect();
+        let cipher = encrypt_with_server_public_key(&blob, &secret).expect("encrypt must succeed on a valid RSA1 blob");
+
+        let d = num_bigint::BigUint::from_bytes_be(&unhex(TEST_D_HEX));
+        let c = num_bigint::BigUint::from_bytes_le(&cipher);
+        let x = c.modpow(&d, &n);
+        let recovered = x.to_bytes_le();
+        assert_eq!(&recovered[..secret.len()], &secret[..]);
+    }
+
+    /// A single-certificate chain whose length field claims a shorter blob
+    /// must surface the truncation with blob diagnostics, not panic.
+    #[test]
+    fn truncated_blob_reports_diagnostics() {
+        let blob = vec![2u8, 0, 0, 0, 1, 0, 0, 0, 0xFF, 0, 0, 0];
+        let error = encrypt_with_server_public_key(&blob, &[0u8; 32]).unwrap_err();
+        assert!(matches!(error, SecurityError::CertTruncated(_)));
+        assert!(error.to_string().contains("blob 12B"));
+    }
+
+    /// A chain whose leaf certificate is not valid DER surfaces the parse
+    /// failure with the blob diagnostics (instead of a bare error).
+    #[test]
+    fn x509_leaf_parse_failure_carries_context() {
+        let mut blob = x509_chain_blob(&unhex(TEST_CERT_DER_HEX));
+        // Replace the leaf certificate with a short garbage buffer, keeping
+        // the declared length field consistent so the chain walk succeeds
+        // and the failure lands in the leaf parse.
+        let leaf_start = blob.len() - unhex(TEST_CERT_DER_HEX).len();
+        for byte in &mut blob[leaf_start..] {
+            *byte = 0xA5;
+        }
+        let error = encrypt_with_server_public_key(&blob, &[0u8; 32]).unwrap_err();
+        assert!(matches!(error, SecurityError::CertNoPublicKey(_)));
+        assert!(error.to_string().contains("blob"));
     }
 }
