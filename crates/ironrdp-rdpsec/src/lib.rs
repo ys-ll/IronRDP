@@ -455,13 +455,26 @@ fn encrypt_with_proprietary_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec
 /// ciphertext comes back little-endian — the same raw-modpow shape the
 /// proprietary path uses.
 fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<u8>, SecurityError> {
-    const CHAIN_HEADER_SIZE: usize = 8; // dwVersion + certCount
+    const CHAIN_HEADER_SIZE: usize = 8; // dwVersion + numCertBlobs
     const CERT_LENGTH_FIELD_SIZE: usize = 4;
-    const X509_PADDING_SIZE: usize = 8;
+
+    // [MS-RDPBCGR 2.2.1.4.3.1.1.2] X.509 Certificate Chain: numCertBlobs
+    // followed by numCertBlobs × (certLen + certData) laid out back to back —
+    // no inter-certificate padding (FreeRDP's certificate_read_server_x509_
+    // certificate_chain walks them the same way). The last certificate is the
+    // Terminal Server certificate whose key encrypts the client random.
+    if server_cert.len() < CHAIN_HEADER_SIZE {
+        return Err(SecurityError::CertTruncated);
+    }
+    let cert_count =
+        u32::from_le_bytes(server_cert[4..8].try_into().unwrap()) as usize;
+    if cert_count == 0 {
+        return Err(SecurityError::CertNoPublicKey);
+    }
 
     let mut offset = CHAIN_HEADER_SIZE;
     let mut leaf: Option<&[u8]> = None;
-    loop {
+    for _ in 0..cert_count {
         let cert_len = u32::from_le_bytes(
             server_cert
                 .get(offset..offset + CERT_LENGTH_FIELD_SIZE)
@@ -473,11 +486,8 @@ fn encrypt_with_x509_chain_key(server_cert: &[u8], secret: &[u8]) -> Result<Vec<
         let cert = server_cert
             .get(offset..offset + cert_len)
             .ok_or(SecurityError::CertTruncated)?;
-        offset += cert_len + X509_PADDING_SIZE;
+        offset += cert_len;
         leaf = Some(cert);
-        if offset >= server_cert.len() {
-            break;
-        }
     }
 
     let leaf = leaf.ok_or(SecurityError::CertTruncated)?;
