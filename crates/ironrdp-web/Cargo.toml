@@ -59,6 +59,11 @@ web-sys = { version = "0.3", features = [
     "Navigator",
     "Performance",
     "Window",
+    "WebGl2RenderingContext",
+    "WebGlBuffer",
+    "WebGlProgram",
+    "WebGlShader",
+    "WebGlTexture",
 ] }
 js-sys = "0.3"
 gloo-net = { version = "0.7", default-features = false, features = ["websocket", "http", "io-util"] }
