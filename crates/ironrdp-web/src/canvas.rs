@@ -36,13 +36,12 @@ impl Canvas {
         self.canvas.set_height(height.get());
     }
 
-    /// Blits a dirty region with `put_image_data`. Forces alpha opaque first: the framebuffer isn't
-    /// guaranteed opaque (zero-init columns, QOI-RGBA) and `put_image_data` stores alpha verbatim.
+    /// Blits a dirty region with `put_image_data`. The framebuffer's alpha
+    /// channel is not guaranteed opaque (zero-init columns, QOI-RGBA), but
+    /// the context is created with `alpha: false`, so the compositor treats
+    /// the canvas as fully opaque and the stored alpha is never displayed —
+    /// forcing it per pixel here would only burn CPU on every draw.
     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
-        for pixel in buffer.chunks_exact_mut(4) {
-            pixel[3] = 0xFF;
-        }
-
         #[cfg(target_arch = "wasm32")]
         {
             let image = ImageData::new_with_u8_clamped_array_and_sh(
@@ -67,8 +66,16 @@ impl Canvas {
 fn context_2d(canvas: &HtmlCanvasElement) -> anyhow::Result<CanvasRenderingContext2d> {
     #[cfg(target_arch = "wasm32")]
     {
+        let options = js_sys::Object::new();
+        js_sys::Reflect::set(
+            &options,
+            &wasm_bindgen::JsValue::from_str("alpha"),
+            &wasm_bindgen::JsValue::from(false),
+        )
+        .map_err(|err| anyhow!("failed to build the 2d context options: {err:?}"))?;
+
         canvas
-            .get_context("2d")
+            .get_context_with_context_options("2d", &options)
             .map_err(|err| anyhow!("get_context(\"2d\") failed: {err:?}"))?
             .ok_or_else(|| anyhow!("canvas has no 2d context"))?
             .dyn_into::<CanvasRenderingContext2d>()
