@@ -1,4 +1,7 @@
+use core::cell::RefCell;
 use core::num::NonZeroU32;
+#[cfg(target_arch = "wasm32")]
+use std::rc::Rc;
 
 #[cfg(target_arch = "wasm32")]
 use anyhow::anyhow;
@@ -24,14 +27,15 @@ use web_sys::{
 /// the framebuffer's alpha channel is not guaranteed (zero-init columns,
 /// QOI-RGBA), but an opaque canvas never displays stored alpha, which keeps
 /// the blit free of any per-pixel alpha fixups.
+///
+/// Drawing and presenting are separated: `draw` only uploads a region, and a
+/// requestAnimationFrame loop presents the composed texture once per display
+/// frame. Servers deliver scrolling updates as bursts of thin strips; without
+/// the coalescing the client would paint each strip the moment it decodes,
+/// which reads as visible stepped refresh.
 pub(crate) struct Canvas {
     canvas: HtmlCanvasElement,
-    renderer: Renderer,
-}
-
-enum Renderer {
-    WebGl2(WebGl),
-    Canvas2d(Canvas2d),
+    renderer: Rc<RefCell<Renderer>>,
 }
 
 impl Canvas {
@@ -42,6 +46,10 @@ impl Canvas {
             Ok(webgl) => Renderer::WebGl2(webgl),
             Err(_) => Renderer::Canvas2d(Canvas2d::new(render_canvas.clone(), width, height)?),
         };
+        let renderer = Rc::new(RefCell::new(renderer));
+
+        #[cfg(target_arch = "wasm32")]
+        spawn_present_loop(renderer.clone());
 
         Ok(Self {
             canvas: render_canvas,
@@ -54,17 +62,41 @@ impl Canvas {
     pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<()> {
         self.canvas.set_width(width.get());
         self.canvas.set_height(height.get());
-        match &mut self.renderer {
-            Renderer::WebGl2(webgl) => webgl.resize(width, height)?,
-            Renderer::Canvas2d(canvas2d) => canvas2d.resize(width, height),
-        }
-        Ok(())
+        self.renderer.borrow_mut().resize(width, height)
     }
 
     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
-        match &self.renderer {
-            Renderer::WebGl2(webgl) => webgl.draw(buffer, region),
+        self.renderer.borrow().draw(buffer, region)
+    }
+}
+
+enum Renderer {
+    WebGl2(WebGl),
+    Canvas2d(Canvas2d),
+}
+
+impl Renderer {
+    /// Uploads a region into the render target. Cheap by design: presentation
+    /// happens on the rAF loop, not here.
+    fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+        match self {
+            Renderer::WebGl2(webgl) => webgl.upload(buffer, region),
             Renderer::Canvas2d(canvas2d) => canvas2d.draw(buffer, region),
+        }
+    }
+
+    /// Composes and presents the current texture content.
+    fn present(&self) {
+        match self {
+            Renderer::WebGl2(webgl) => webgl.present(),
+            Renderer::Canvas2d(_) => {}
+        }
+    }
+
+    fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<()> {
+        match self {
+            Renderer::WebGl2(webgl) => webgl.resize(width, height),
+            Renderer::Canvas2d(canvas2d) => Ok(canvas2d.resize(width, height)),
         }
     }
 }
@@ -123,13 +155,13 @@ impl WebGl {
         if position_location == -1 {
             return Err(anyhow!("a_position attribute not found"));
         }
-        ctx.vertex_attrib_pointer_with_f64(
+        ctx.vertex_attrib_pointer_with_i32(
             position_location as u32,
             2,
             WebGl2RenderingContext::FLOAT,
             false,
             0,
-            0.0,
+            0,
         );
         ctx.enable_vertex_attrib_array(position_location as u32);
 
@@ -147,13 +179,13 @@ impl WebGl {
         if tex_coord_location == -1 {
             return Err(anyhow!("a_tex_coord attribute not found"));
         }
-        ctx.vertex_attrib_pointer_with_f64(
+        ctx.vertex_attrib_pointer_with_i32(
             tex_coord_location as u32,
             2,
             WebGl2RenderingContext::FLOAT,
             false,
             0,
-            0.0,
+            0,
         );
         ctx.enable_vertex_attrib_array(tex_coord_location as u32);
 
@@ -199,7 +231,8 @@ impl WebGl {
         allocate_texture(&self.ctx, width.get(), height.get())
     }
 
-    fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+    /// Uploads a region into the desktop texture. No presentation here.
+    fn upload(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
         let ctx = &self.ctx;
         ctx.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&self.texture));
         // SAFETY: the view borrows the wasm linear memory for the duration of
@@ -219,32 +252,22 @@ impl WebGl {
             0,
         )
         .map_err(|err| anyhow!("texSubImage2D failed: {err:?}"))?;
-        // DEBUG(diagnostics round): clear to red first so a failed texture
-        // upload is distinguishable from a failed present — red means the
-        // quad draws but the upload does not, desktop means everything works.
-        ctx.clear_color(1.0, 0.0, 0.0, 1.0);
-        ctx.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
-        ctx.draw_arrays(WebGl2RenderingContext::TRIANGLE_STRIP, 0, 4);
-
-        let gl_error = ctx.get_error();
-        if gl_error != WebGl2RenderingContext::NO_ERROR {
-            return Err(anyhow!(
-                "WebGL error 0x{gl_error:04X} after drawing region {}x{} at ({},{})",
-                region.width(),
-                region.height(),
-                region.left,
-                region.top
-            ));
-        }
         Ok(())
+    }
+
+    /// Presents the composed desktop texture with a single quad draw.
+    fn present(&self) {
+        self.ctx.bind_texture(WebGl2RenderingContext::TEXTURE_2D, Some(&self.texture));
+        self.ctx.draw_arrays(WebGl2RenderingContext::TRIANGLE_STRIP, 0, 4);
     }
 }
 
 /// Uploads an empty texture of the given size (content arrives per region).
+///
+/// The PBO-offset overload would raise GL_INVALID_OPERATION without a bound
+/// PIXEL_UNPACK_BUFFER, leaving the texture without a data store; the
+/// no-source variant allocates the data store directly.
 fn allocate_texture(ctx: &WebGl2RenderingContext, width: u32, height: u32) -> anyhow::Result<()> {
-    // The PBO-offset overload would raise GL_INVALID_OPERATION without a
-    // bound PIXEL_UNPACK_BUFFER, leaving the texture without storage; the
-    // no-source variant allocates the data store directly.
     ctx.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
         WebGl2RenderingContext::TEXTURE_2D,
         0,
@@ -354,6 +377,8 @@ impl Canvas2d {
         self.canvas.set_height(height.get());
     }
 
+    /// Canvas2D has no separate present step: `put_image_data` paints
+    /// immediately.
     fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
         #[cfg(target_arch = "wasm32")]
         {
@@ -399,4 +424,29 @@ fn context_2d(canvas: &HtmlCanvasElement) -> anyhow::Result<CanvasRenderingConte
         let _ = canvas;
         unimplemented!("web canvas is only available on wasm32")
     }
+}
+
+/// Spawns the requestAnimationFrame loop that presents the composed texture
+/// once per display frame. The renderer is kept alive by the closure for the
+/// lifetime of the page.
+#[cfg(target_arch = "wasm32")]
+fn spawn_present_loop(renderer: Rc<RefCell<Renderer>>) {
+    use wasm_bindgen::prelude::Closure;
+
+    let f: Rc<RefCell<Option<Closure<dyn FnMut()>>>> = Rc::new(RefCell::new(None));
+    let g = f.clone();
+    *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
+        renderer.borrow().present();
+        let window = web_sys::window().expect("no window");
+        let scheduled = f.borrow();
+        let next = scheduled.as_ref().unwrap().as_ref().unchecked_ref();
+        window
+            .request_animation_frame(next)
+            .expect("failed to schedule the next present");
+    })));
+
+    let window = web_sys::window().expect("no window");
+    window
+        .request_animation_frame(g.borrow().as_ref().unwrap().as_ref().unchecked_ref())
+        .expect("failed to schedule the present loop");
 }
