@@ -218,7 +218,23 @@ impl WebGl {
             0,
         )
         .map_err(|err| anyhow!("texSubImage2D failed: {err:?}"))?;
+        // DEBUG(diagnostics round): clear to red first so a failed texture
+        // upload is distinguishable from a failed present — red means the
+        // quad draws but the upload does not, desktop means everything works.
+        ctx.clear_color(1.0, 0.0, 0.0, 1.0);
+        ctx.clear(WebGl2RenderingContext::COLOR_BUFFER_BIT);
         ctx.draw_arrays(WebGl2RenderingContext::TRIANGLE_STRIP, 0, 4);
+
+        let gl_error = ctx.get_error();
+        if gl_error != WebGl2RenderingContext::NO_ERROR {
+            return Err(anyhow!(
+                "WebGL error 0x{gl_error:04X} after drawing region {}x{} at ({},{})",
+                region.width(),
+                region.height(),
+                region.left,
+                region.top
+            ));
+        }
         Ok(())
     }
 }
