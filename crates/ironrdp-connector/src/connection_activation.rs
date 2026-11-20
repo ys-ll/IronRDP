@@ -6,6 +6,7 @@ use ironrdp_pdu::rdp::capability_sets::{
     CapabilitySet, InputFlags, Rail, RailSupportLevel, WindowList, WindowSupportLevel,
 };
 use ironrdp_pdu::rdp::server_redirection::ServerRedirectionPdu;
+use ironrdp_rdpsec::SEC_LICENSE_PKT;
 use tracing::{debug, info, warn};
 
 use crate::{
@@ -163,6 +164,27 @@ impl Sequence for ConnectionActivationSequence {
             return Ok(Written::Nothing);
         }
 
+        // A late Server License PDU (session management traffic, observed when
+        // a Windows server reattaches a taken-over session) carries its own
+        // BasicSecurityHeader with the LICENSE_PKT flag instead of a Share
+        // Control header. Licensing already ran during the connection sequence
+        // and late license PDUs expect no client response: skip it and keep
+        // waiting for the PDU this phase actually needs.
+        if matches!(
+            self.state,
+            ConnectionActivationState::CapabilitiesExchange | ConnectionActivationState::ConnectionFinalization { .. }
+        ) && let Ok(data) = ironrdp_pdu::mcs::decode_send_data_indication(input)
+            && data.user_data.len() >= 4
+            && u16::from_le_bytes([data.user_data[0], data.user_data[1]]) & SEC_LICENSE_PKT != 0
+            && u16::from_le_bytes([data.user_data[2], data.user_data[3]]) == 0
+        {
+            debug!(
+                len = data.user_data.len(),
+                "Ignoring a late Server License PDU outside the licensing exchange"
+            );
+            return Ok(Written::Nothing);
+        }
+
         let (written, next_state) = match mem::take(&mut self.state) {
             ConnectionActivationState::Consumed
             | ConnectionActivationState::Finalized { .. }
@@ -176,50 +198,51 @@ impl Sequence for ConnectionActivationSequence {
 
                 let send_data_indication_ctx =
                     ironrdp_pdu::mcs::decode_send_data_indication(input).map_err(ConnectorError::decode)?;
-                let share_control_ctx = rdp::headers::decode_share_control(send_data_indication_ctx).map_err(|error| {
-                    // Surface the offending bytes in the error itself: the WASM
-                    // client's tracing does not reach the desktop log, so a failed
-                    // slow-path decode here is otherwise unattributable.
-                    #[derive(Debug)]
-                    struct ShareControlDecodeDiagnostics {
-                        user_data_len: usize,
-                        head_hex: String,
-                        source: ironrdp_core::DecodeError,
-                    }
-
-                    impl fmt::Display for ShareControlDecodeDiagnostics {
-                        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                            write!(
-                                f,
-                                "Share Control PDU decode failed ({} bytes, head: {})",
-                                self.user_data_len, self.head_hex
-                            )
+                let share_control_ctx =
+                    rdp::headers::decode_share_control(send_data_indication_ctx).map_err(|error| {
+                        // Surface the offending bytes in the error itself: the WASM
+                        // client's tracing does not reach the desktop log, so a failed
+                        // slow-path decode here is otherwise unattributable.
+                        #[derive(Debug)]
+                        struct ShareControlDecodeDiagnostics {
+                            user_data_len: usize,
+                            head_hex: String,
+                            source: ironrdp_core::DecodeError,
                         }
-                    }
 
-                    impl core::error::Error for ShareControlDecodeDiagnostics {
-                        fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
-                            Some(&self.source)
+                        impl fmt::Display for ShareControlDecodeDiagnostics {
+                            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                                write!(
+                                    f,
+                                    "Share Control PDU decode failed ({} bytes, head: {})",
+                                    self.user_data_len, self.head_hex
+                                )
+                            }
                         }
-                    }
 
-                    let user_data = send_data_indication_ctx.user_data;
-                    let head_hex = user_data
-                        .iter()
-                        .take(96)
-                        .map(|byte| format!("{byte:02X}"))
-                        .collect::<Vec<_>>()
-                        .join(" ");
-
-                    custom_err!(
-                        "CapabilitiesExchange",
-                        ShareControlDecodeDiagnostics {
-                            user_data_len: user_data.len(),
-                            head_hex,
-                            source: error,
+                        impl core::error::Error for ShareControlDecodeDiagnostics {
+                            fn source(&self) -> Option<&(dyn core::error::Error + 'static)> {
+                                Some(&self.source)
+                            }
                         }
-                    )
-                })?;
+
+                        let user_data = send_data_indication_ctx.user_data;
+                        let head_hex = user_data
+                            .iter()
+                            .take(96)
+                            .map(|byte| format!("{byte:02X}"))
+                            .collect::<Vec<_>>()
+                            .join(" ");
+
+                        custom_err!(
+                            "CapabilitiesExchange",
+                            ShareControlDecodeDiagnostics {
+                                user_data_len: user_data.len(),
+                                head_hex,
+                                source: error,
+                            }
+                        )
+                    })?;
 
                 debug!(message = ?share_control_ctx.pdu, "Received");
 

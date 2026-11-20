@@ -354,7 +354,46 @@ impl Processor {
     ) -> SessionResult<Vec<ProcessorOutput>> {
         debug_assert_eq!(data_ctx.channel_id, self.io_channel_id);
 
-        let io_channel = ironrdp_pdu::rdp::headers::decode_io_channel(data_ctx).map_err(SessionError::decode)?;
+        // A late Server License PDU (session-management traffic, observed when
+        // a Windows server reattaches a taken-over session) carries its own
+        // BasicSecurityHeader with the LICENSE_PKT flag instead of a Share
+        // Control header: licensing already ran during the connection sequence
+        // and late license PDUs expect no client response. The pduType field
+        // (offset 2..4) is never zero for a Share Control header, so the
+        // flags_hi == 0 guard cannot misfire on ordinary share traffic.
+        if data_ctx.user_data.len() >= 4
+            && u16::from_le_bytes([data_ctx.user_data[0], data_ctx.user_data[1]]) & ironrdp_rdpsec::SEC_LICENSE_PKT != 0
+            && u16::from_le_bytes([data_ctx.user_data[2], data_ctx.user_data[3]]) == 0
+        {
+            debug!(
+                len = data_ctx.user_data.len(),
+                "Ignoring a late Server License PDU outside the licensing exchange"
+            );
+            return Ok(Vec::new());
+        }
+
+        let io_channel = ironrdp_pdu::rdp::headers::decode_io_channel(data_ctx).map_err(|error| {
+            // Surface the offending bytes in the error itself: this decode
+            // sits on the boundary of every server management stream, and
+            // without them a failed decode here is unattributable from the
+            // desktop log alone (the WASM client's tracing does not reach
+            // it).
+            let head_hex = data_ctx
+                .user_data
+                .iter()
+                .take(96)
+                .map(|byte| format!("{byte:02X}"))
+                .collect::<Vec<_>>()
+                .join(" ");
+            SessionError::reason(
+                "X224",
+                format!(
+                    "IO channel PDU decode failed ({} bytes, head: {}): {error}",
+                    data_ctx.user_data.len(),
+                    head_hex
+                ),
+            )
+        })?;
 
         match io_channel {
             IoChannelPdu::Data(ctx) => Self::process_share_data(ctx, bulk_decompressor),

@@ -1561,14 +1561,20 @@ impl Sequence for ClientConnector {
         // bootstrapping reads its requests from the message channel, so it routes by
         // channel itself.
         let io_channel_phase_ids = match &self.state {
-            ClientConnectorState::ConnectTimeAutoDetection { io_channel_id, user_channel_id }
-            | ClientConnectorState::LicensingExchange { io_channel_id, user_channel_id, .. } => {
-                Some((*io_channel_id, *user_channel_id))
+            ClientConnectorState::ConnectTimeAutoDetection {
+                io_channel_id,
+                user_channel_id,
             }
+            | ClientConnectorState::LicensingExchange {
+                io_channel_id,
+                user_channel_id,
+                ..
+            } => Some((*io_channel_id, *user_channel_id)),
             ClientConnectorState::CapabilitiesExchange { connection_activation }
-            | ClientConnectorState::ConnectionFinalization { connection_activation } => {
-                Some((connection_activation.io_channel_id(), connection_activation.user_channel_id()))
-            }
+            | ClientConnectorState::ConnectionFinalization { connection_activation } => Some((
+                connection_activation.io_channel_id(),
+                connection_activation.user_channel_id(),
+            )),
             _ => None,
         };
 
@@ -1960,10 +1966,7 @@ impl Sequence for ClientConnector {
                         .unwrap_or_else(|| Arc::new(NoopLicenseCache)),
                 );
                 license_exchange.security = self.security.clone();
-                license_exchange.server_cert = self
-                    .server_security
-                    .as_ref()
-                    .map(|s| s.server_cert.clone());
+                license_exchange.server_cert = self.server_security.as_ref().map(|s| s.server_cert.clone());
                 // If a PDU was read (message channel present) it is the first
                 // licensing PDU; advance the licensing sequence with it now,
                 // through the same helper the LicensingExchange state uses, so
@@ -2044,7 +2047,8 @@ impl Sequence for ClientConnector {
                     // `step_message_channel_pdu`. Only multitransport requests count
                     // towards the cap.
                     if !security_header_contains(ctx.user_data, rdp::headers::BasicSecurityHeaderFlags::TRANSPORT_REQ) {
-                        let written = self.step_message_channel_pdu(ctx, received_at, io_channel_id, user_channel_id, output)?;
+                        let written =
+                            self.step_message_channel_pdu(ctx, received_at, io_channel_id, user_channel_id, output)?;
 
                         self.state = ClientConnectorState::MultitransportBootstrapping {
                             io_channel_id,
@@ -2410,6 +2414,14 @@ impl ClientConnector {
                         | ClientConnectorState::ConnectTimeAutoDetection { .. }
                 );
                 let is_message_channel = self.message_channel_id == Some(data.channel_id);
+                if flags & SEC_LICENSE_PKT != 0 && !is_message_channel {
+                    // A license PDU outside (or inside) the licensing exchange
+                    // keeps its embedded header either way: the LicensePdu
+                    // decoder consumes it during the exchange, and the
+                    // activation sequence skips late arrivals (session
+                    // management traffic, e.g. after a takeover).
+                    return Ok(Cow::Borrowed(input));
+                }
                 if is_license_phase && !is_message_channel {
                     return Ok(Cow::Borrowed(input));
                 }

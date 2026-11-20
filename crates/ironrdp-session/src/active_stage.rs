@@ -30,7 +30,9 @@ use ironrdp_pdu::window::{
 use ironrdp_pdu::x224::X224;
 use ironrdp_pdu::{Action, mcs};
 use ironrdp_rdpei::RdpeiClient;
-use ironrdp_rdpsec::{SEC_AUTODETECT_RSP, SEC_ENCRYPT, SEC_SECURE_CHECKSUM, SEC_TRANSPORT_RSP, SharedSecurity};
+use ironrdp_rdpsec::{
+    SEC_AUTODETECT_RSP, SEC_ENCRYPT, SEC_LICENSE_PKT, SEC_SECURE_CHECKSUM, SEC_TRANSPORT_RSP, SharedSecurity,
+};
 use ironrdp_svc::{StaticChannelSet, SvcMessage, SvcProcessor, SvcProcessorMessages};
 use tracing::{debug, trace, warn};
 
@@ -473,6 +475,36 @@ impl ActiveStage {
             return Ok(Cow::Borrowed(frame));
         }
         let flags = u16::from_le_bytes([data.user_data[0], data.user_data[1]]);
+        if flags & SEC_LICENSE_PKT != 0 {
+            // A Server License PDU after the connection sequence's licensing
+            // exchange (observed mid-session when a Windows server reattaches
+            // a taken-over session): session-management traffic that carries
+            // no Share Control header and expects no client response. Consume
+            // the keystream for the encrypted variant — every received frame
+            // must advance the receive RC4 stream or later decryptions desync
+            // into garbage — then drop the PDU by handing the demux an empty
+            // Send Data Indication on the same channel.
+            if flags & SEC_ENCRYPT != 0 {
+                if data.user_data.len() < 12 {
+                    return Err(reason_err!("x224", "encrypted slow-path PDU is too short for a MAC"));
+                }
+                let _plaintext = security
+                    .lock()
+                    .unwrap()
+                    .decrypt_checked(&data.user_data[12..], &data.user_data[4..12]);
+            }
+            debug!(
+                len = data.user_data.len(),
+                "Dropped a late Server License PDU outside the licensing exchange"
+            );
+            let empty = mcs::McsMessage::SendDataIndication(mcs::SendDataIndication {
+                initiator_id: data.initiator_id,
+                channel_id: data.channel_id,
+                user_data: Cow::Owned(Vec::new()),
+            });
+            let frame = encode_vec(&X224(empty)).map_err(SessionError::encode)?;
+            return Ok(Cow::Owned(frame));
+        }
         if flags & SEC_ENCRYPT == 0 {
             trace!(
                 "X224PLAIN ch={} len={} raw={}",
