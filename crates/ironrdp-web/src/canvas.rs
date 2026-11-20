@@ -51,13 +51,14 @@ impl Canvas {
 
     /// Resizes the backing store. Note: this also clears the canvas and resets
     /// context state; the cached renderer stays valid.
-    pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) {
+    pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<()> {
         self.canvas.set_width(width.get());
         self.canvas.set_height(height.get());
         match &mut self.renderer {
-            Renderer::WebGl2(webgl) => webgl.resize(width, height),
+            Renderer::WebGl2(webgl) => webgl.resize(width, height)?,
             Renderer::Canvas2d(canvas2d) => canvas2d.resize(width, height),
         }
+        Ok(())
     }
 
     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
@@ -182,7 +183,7 @@ impl WebGl {
         );
 
         ctx.viewport(0, 0, width.get() as i32, height.get() as i32);
-        allocate_texture(&ctx, width.get(), height.get());
+        allocate_texture(&ctx, width.get(), height.get())?;
 
         Ok(Self {
             ctx,
@@ -193,9 +194,9 @@ impl WebGl {
         })
     }
 
-    fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) {
+    fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<()> {
         self.ctx.viewport(0, 0, width.get() as i32, height.get() as i32);
-        allocate_texture(&self.ctx, width.get(), height.get());
+        allocate_texture(&self.ctx, width.get(), height.get())
     }
 
     fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
@@ -240,8 +241,11 @@ impl WebGl {
 }
 
 /// Uploads an empty texture of the given size (content arrives per region).
-fn allocate_texture(ctx: &WebGl2RenderingContext, width: u32, height: u32) {
-    ctx.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_i32(
+fn allocate_texture(ctx: &WebGl2RenderingContext, width: u32, height: u32) -> anyhow::Result<()> {
+    // The PBO-offset overload would raise GL_INVALID_OPERATION without a
+    // bound PIXEL_UNPACK_BUFFER, leaving the texture without storage; the
+    // no-source variant allocates the data store directly.
+    ctx.tex_image_2d_with_i32_and_i32_and_i32_and_format_and_type_and_opt_u8_array(
         WebGl2RenderingContext::TEXTURE_2D,
         0,
         WebGl2RenderingContext::RGBA as i32,
@@ -250,9 +254,9 @@ fn allocate_texture(ctx: &WebGl2RenderingContext, width: u32, height: u32) {
         0,
         WebGl2RenderingContext::RGBA,
         WebGl2RenderingContext::UNSIGNED_BYTE,
-        0,
+        None,
     )
-    .ok();
+    .map_err(|err| anyhow!("texImage2D allocation failed: {err:?}"))
 }
 
 /// The fullscreen quad. Texture coordinates are V-flipped: GL texture row 0
