@@ -1,4 +1,5 @@
 use core::cell::RefCell;
+use core::cell::Cell;
 use core::num::NonZeroU32;
 #[cfg(target_arch = "wasm32")]
 use std::rc::Rc;
@@ -36,12 +37,15 @@ use web_sys::{
 pub(crate) struct Canvas {
     canvas: HtmlCanvasElement,
     renderer: Rc<RefCell<Renderer>>,
+    /// The size the canvas backing store and render target were created at.
+    size: Cell<(u32, u32)>,
 }
 
 impl Canvas {
     pub(crate) fn new(render_canvas: HtmlCanvasElement, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<Self> {
         render_canvas.set_width(width.get());
         render_canvas.set_height(height.get());
+        let size = Cell::new((width.get(), height.get()));
         let renderer = match WebGl::new(&render_canvas, width, height) {
             Ok(webgl) => Renderer::WebGl2(webgl),
             Err(_) => Renderer::Canvas2d(Canvas2d::new(render_canvas.clone(), width, height)?),
@@ -54,6 +58,7 @@ impl Canvas {
         Ok(Self {
             canvas: render_canvas,
             renderer,
+            size,
         })
     }
 
@@ -62,10 +67,34 @@ impl Canvas {
     pub(crate) fn resize(&mut self, width: NonZeroU32, height: NonZeroU32) -> anyhow::Result<()> {
         self.canvas.set_width(width.get());
         self.canvas.set_height(height.get());
+        self.size.set((width.get(), height.get()));
         self.renderer.borrow_mut().resize(width, height)
     }
 
     pub(crate) fn draw(&self, buffer: &mut [u8], region: InclusiveRectangle) -> anyhow::Result<()> {
+        // Regions are image-relative; the canvas only covers the size it was
+        // created at. A region outside it means the server session geometry
+        // diverged from the client's (e.g. the resize could not be applied
+        // because the Display Control channel is unavailable) — surface it
+        // instead of silently drawing off-canvas into a black screen.
+        let (canvas_width, canvas_height) = self.size.get();
+        let right = region.right;
+        let bottom = region.bottom;
+        if region.left < 0
+            || region.top < 0
+            || u32::from(right) > canvas_width
+            || u32::from(bottom) > canvas_height
+        {
+            return Err(anyhow!(
+                "update region {}x{} at ({},{}) exceeds the {}x{} canvas —                  the remote session geometry does not match the client canvas",
+                region.width(),
+                region.height(),
+                region.left,
+                region.top,
+                canvas_width,
+                canvas_height
+            ));
+        }
         self.renderer.borrow().draw(buffer, region)
     }
 }
