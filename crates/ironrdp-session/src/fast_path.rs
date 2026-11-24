@@ -739,7 +739,7 @@ impl Processor {
                         )
                     })?;
 
-                    trace!(?codec_id, "Surface bits");
+                    debug!(?codec_id, "Surface bits");
 
                     let destination = bits.destination;
                     // TODO(@pacmancoder): Correct rectangle conversion logic should
