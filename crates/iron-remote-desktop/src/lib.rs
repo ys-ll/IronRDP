@@ -119,6 +119,14 @@ macro_rules! make_bridge {
 
         #[$crate::internal::wasm_bindgen::prelude::wasm_bindgen]
         #[doc(hidden)]
+        pub fn setup_with_callback(log_level: &str, callback: $crate::internal::web_sys::js_sys::Function) {
+            <$api as $crate::RemoteDesktopApi>::pre_setup();
+            $crate::internal::setup_with_callback(&log_level, callback);
+            <$api as $crate::RemoteDesktopApi>::post_setup();
+        }
+
+        #[$crate::internal::wasm_bindgen::prelude::wasm_bindgen]
+        #[doc(hidden)]
         impl Session {
             pub async fn run(&self) -> Result<SessionTerminationInfo, IronError> {
                 $crate::Session::run(&self.0)
@@ -470,6 +478,78 @@ pub mod internal {
             set_logger_once(level);
         }
     }
+
+    /// Same as [`setup`], but the subscriber writes every formatted event line
+    /// through `callback` (one JS call per line) instead of `console.log`, and
+    /// panics are routed to the callback too. Lets embedders persist session
+    /// logs where the browser console is not reachable.
+    pub fn setup_with_callback(log_level: &str, callback: web_sys::js_sys::Function) {
+        let _ = LOG_CALLBACK.set(callback);
+        install_callback_panic_hook();
+
+        if let Ok(level) = log_level.parse::<tracing::Level>() {
+            set_logger_once_with_callback(level);
+        }
+    }
+
+    fn set_logger_once_with_callback(level: tracing::Level) {
+        use tracing_subscriber::filter::LevelFilter;
+        use tracing_subscriber::fmt::time::UtcTime;
+        use tracing_subscriber::prelude::*;
+
+        static INIT: std::sync::Once = std::sync::Once::new();
+
+        INIT.call_once(|| {
+            let fmt_layer = tracing_subscriber::fmt::layer()
+                .with_ansi(false)
+                .with_timer(UtcTime::rfc_3339()) // std::time is not available in browsers
+                .with_writer(LogCallbackMaker);
+
+            let level_filter = LevelFilter::from_level(level);
+
+            tracing_subscriber::registry().with(fmt_layer).with(level_filter).init();
+        })
+    }
+
+    fn install_callback_panic_hook() {
+        std::panic::set_hook(Box::new(|info| {
+            if let Some(callback) = LOG_CALLBACK.get() {
+                let message = wasm_bindgen::JsValue::from_str(&format!("PANIC: {info}"));
+                let _ = callback.call1(&wasm_bindgen::JsValue::UNDEFINED, &message);
+            }
+        }));
+    }
+
+    /// The writer for the tracing fmt layer: forwards every formatted line to
+    /// the JS callback registered via `setup_with_callback`.
+    struct LogCallbackMaker;
+
+    struct LogCallbackWriter;
+
+    impl tracing_subscriber::fmt::MakeWriter<'_> for LogCallbackMaker {
+        type Writer = LogCallbackWriter;
+
+        fn make_writer(&self) -> Self::Writer {
+            LogCallbackWriter
+        }
+    }
+
+    impl std::io::Write for LogCallbackWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if let Some(callback) = LOG_CALLBACK.get() {
+                let line = String::from_utf8_lossy(buf);
+                let message = wasm_bindgen::JsValue::from_str(line.trim_end());
+                let _ = callback.call1(&wasm_bindgen::JsValue::UNDEFINED, &message);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    static LOG_CALLBACK: std::sync::OnceLock<web_sys::js_sys::Function> = std::sync::OnceLock::new();
 
     fn set_logger_once(level: tracing::Level) {
         use tracing_subscriber::filter::LevelFilter;
